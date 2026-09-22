@@ -17,6 +17,11 @@
 
     roll,pitch,yaw,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,magX,magY,magZ
 
+  Roll/pitch/yaw are sent already zero-referenced: pressing "Zero Roll /
+  Pitch / Yaw" in the browser sends a "ZERO" command back over the same
+  WebSocket, and the CodeCell stores the current orientation as its new
+  zero point in flash (NVS), so the zero survives a power cycle.
+
   The browser receives every message but only redraws the instruments
   and readouts once every 100ms (10 Hz), so the display update rate is
   decoupled from the data rate. See DISPLAY_UPDATE_INTERVAL_MS in the
@@ -41,16 +46,28 @@
   change.
 */
 
+#include <math.h>
 #include <CodeCell.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
+#include <Preferences.h>
 
 CodeCell myCodeCell;
 
 // Port 80 serves the webpage. Port 81 carries the live IMU data.
 WebServer webServer(80);
 WebSocketsServer webSocket(81);
+
+// Persists the Roll/Pitch/Yaw zero-reference offsets in flash (NVS) so they
+// survive a power cycle. Written whenever the browser's "Zero Roll / Pitch /
+// Yaw" button sends a "ZERO" command over the WebSocket.
+Preferences preferences;
+const char* PREFS_NAMESPACE = "pfd";
+
+float OffsetRoll = 0.0;
+float OffsetPitch = 0.0;
+float OffsetYaw = 0.0;
 
 float Roll = 0.0;
 float Pitch = 0.0;
@@ -594,28 +611,8 @@ const char webpage[] PROGMEM = R"HTML(
     // DISPLAY_UPDATE_INTERVAL_MS render loop rather than on every message.
     let latestReading = null;
 
-    // Zero-reference offsets set by the "Zero Roll / Pitch / Yaw" button.
-    let offsetRoll = 0;
-    let offsetPitch = 0;
-    let offsetYaw = 0;
-
-    // Latest raw (uncalibrated) attitude, kept fresh even while frozen so
-    // the calibrate button always zeroes against the current orientation.
-    let lastRoll = 0;
-    let lastPitch = 0;
-    let lastYaw = 0;
-
     function clamp(value, minimum, maximum) {
       return Math.min(maximum, Math.max(minimum, value));
-    }
-
-    // Keeps an angle within -180..180 after an offset is subtracted, so
-    // calibrated values don't jump when they cross the wrap point.
-    function wrapAngle180(deg) {
-      let a = deg % 360;
-      if (a > 180) a -= 360;
-      if (a < -180) a += 360;
-      return a;
     }
 
     // Standard tilt-compensated compass heading from raw magnetometer data.
@@ -726,12 +723,6 @@ const char webpage[] PROGMEM = R"HTML(
           mx, my, mz
         ] = data;
 
-        // Keep the latest raw attitude around so the calibrate button can
-        // zero against it even when the display is frozen.
-        lastRoll = roll;
-        lastPitch = pitch;
-        lastYaw = yaw;
-
         // Stash the full reading; renderInstruments() picks it up on the
         // next DISPLAY_UPDATE_INTERVAL_MS tick instead of drawing here.
         latestReading = { roll, pitch, yaw, ax, ay, az, gx, gy, gz, mx, my, mz };
@@ -754,15 +745,13 @@ const char webpage[] PROGMEM = R"HTML(
     function renderInstruments(reading) {
         const { roll, pitch, yaw, ax, ay, az, gx, gy, gz, mx, my, mz } = reading;
 
-        // Apply the zero-reference offsets set by the calibrate button.
-        const calRoll = wrapAngle180(roll - offsetRoll);
-        const calPitch = wrapAngle180(pitch - offsetPitch);
-        const calYaw = wrapAngle180(yaw - offsetYaw);
+        // roll/pitch/yaw arrive already zero-referenced -- the CodeCell
+        // applies the "Zero Roll / Pitch / Yaw" offset itself before sending.
 
         // Attitude indicator
-        aiRotator.style.transform = `rotate(${ROLL_SIGN * calRoll}deg)`;
-        aiHorizonMask.style.transform = `translateY(${PITCH_SIGN * calPitch * PX_PER_DEG_PITCH}px)`;
-        rpReadout.innerHTML = `R ${calRoll.toFixed(0)}&deg; &nbsp; P ${calPitch.toFixed(0)}&deg; &nbsp; Y ${calYaw.toFixed(0)}&deg;`;
+        aiRotator.style.transform = `rotate(${ROLL_SIGN * roll}deg)`;
+        aiHorizonMask.style.transform = `translateY(${PITCH_SIGN * pitch * PX_PER_DEG_PITCH}px)`;
+        rpReadout.innerHTML = `R ${roll.toFixed(0)}&deg; &nbsp; P ${pitch.toFixed(0)}&deg; &nbsp; Y ${yaw.toFixed(0)}&deg;`;
 
         // Compass (tilt-compensated magnetometer heading)
         const headingDeg = computeHeading(mx, my, mz, roll, pitch);
@@ -829,9 +818,12 @@ const char webpage[] PROGMEM = R"HTML(
     });
 
     calibrateButton.addEventListener("click", function() {
-      offsetRoll = lastRoll;
-      offsetPitch = lastPitch;
-      offsetYaw = lastYaw;
+      // The CodeCell itself records the current orientation as the new
+      // zero point and saves it to flash, so it persists across power
+      // cycles regardless of which browser is connected.
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send("ZERO");
+      }
 
       calibrateStatus.textContent = "Zeroed - this orientation is now level.";
       calibrateStatus.classList.add("calibrated");
@@ -852,6 +844,29 @@ void handleWebpage() {
   webServer.send_P(200, "text/html", webpage);
 }
 
+// Keeps an angle within -180..180 after an offset is subtracted, so
+// calibrated values don't jump when they cross the wrap point.
+float wrapAngle180(float deg) {
+  float a = fmodf(deg, 360.0f);
+  if (a > 180.0f) a -= 360.0f;
+  if (a < -180.0f) a += 360.0f;
+  return a;
+}
+
+// Records the current raw orientation as the new zero reference and saves
+// it to flash (NVS) so it survives a power cycle.
+void zeroAttitude() {
+  OffsetRoll = Roll;
+  OffsetPitch = Pitch;
+  OffsetYaw = Yaw;
+
+  preferences.putFloat("offRoll", OffsetRoll);
+  preferences.putFloat("offPitch", OffsetPitch);
+  preferences.putFloat("offYaw", OffsetYaw);
+
+  Serial.println("Zeroed Roll/Pitch/Yaw and saved to flash");
+}
+
 void webSocketEvent(
   uint8_t clientNumber,
   WStype_t eventType,
@@ -867,6 +882,12 @@ void webSocketEvent(
       Serial.printf("Browser %u disconnected\n", clientNumber);
       break;
 
+    case WStype_TEXT:
+      if (payloadLength == 4 && memcmp(payload, "ZERO", 4) == 0) {
+        zeroAttitude();
+      }
+      break;
+
     default:
       break;
   }
@@ -878,6 +899,13 @@ void setup() {
   // Light (proximity/ambient) and the step counter are not used by this
   // visualizer, so they are left out of Init() entirely.
   myCodeCell.Init(MOTION_ROTATION + MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_MAGNETOMETER);
+
+  // Restore the Roll/Pitch/Yaw zero-reference saved by a previous "Zero
+  // Roll / Pitch / Yaw" press, so it survives a power cycle.
+  preferences.begin(PREFS_NAMESPACE, false);
+  OffsetRoll = preferences.getFloat("offRoll", 0.0);
+  OffsetPitch = preferences.getFloat("offPitch", 0.0);
+  OffsetYaw = preferences.getFloat("offYaw", 0.0);
 
   // Access-point mode lets a phone or computer connect without a router.
   WiFi.mode(WIFI_AP);
@@ -919,15 +947,22 @@ void loop() {
     myCodeCell.Motion_GyroRead(GyroX, GyroY, GyroZ);
     myCodeCell.Motion_MagnetometerRead(MagX, MagY, MagZ);
 
+    // Apply the zero-reference offset before sending, so every connected
+    // browser sees already-calibrated attitude and the zero point lives on
+    // the device rather than in any one browser session.
+    float calRoll = wrapAngle180(Roll - OffsetRoll);
+    float calPitch = wrapAngle180(Pitch - OffsetPitch);
+    float calYaw = wrapAngle180(Yaw - OffsetYaw);
+
     char sensorData[180];
 
     snprintf(
       sensorData,
       sizeof(sensorData),
       "%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
-      Roll,
-      Pitch,
-      Yaw,
+      calRoll,
+      calPitch,
+      calYaw,
       AccelX,
       AccelY,
       AccelZ,
