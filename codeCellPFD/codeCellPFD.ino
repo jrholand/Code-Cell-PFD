@@ -17,6 +17,11 @@
 
     roll,pitch,yaw,accelX,accelY,accelZ,gyroX,gyroY,gyroZ,magX,magY,magZ
 
+  The browser receives every message but only redraws the instruments
+  and readouts once every 100ms (10 Hz), so the display update rate is
+  decoupled from the data rate. See DISPLAY_UPDATE_INTERVAL_MS in the
+  <script> block.
+
   Before compiling, install "WebSockets" by Markus Sattler from:
   Arduino IDE > Tools > Manage Libraries
 
@@ -548,6 +553,11 @@ const char webpage[] PROGMEM = R"HTML(
     const GMETER_MIN = -1;
     const GMETER_MAX = 3;
 
+    // Data arrives from the WebSocket at ~30 Hz, but the page only redraws
+    // the instruments/readouts this often, to keep the display update rate
+    // steady and independent of the incoming data rate.
+    const DISPLAY_UPDATE_INTERVAL_MS = 100;
+
     const statusText = document.getElementById("status");
     const freezeButton = document.getElementById("freezeButton");
     const fullscreenButton = document.getElementById("fullscreenButton");
@@ -575,9 +585,14 @@ const char webpage[] PROGMEM = R"HTML(
 
     let socket;
     let reconnectTimer;
+    let displayTimer;
     let frozen = false;
     let gPeakMax = 1;
     let gPeakMin = 1;
+
+    // Most recent parsed sensor reading, applied to the page by the
+    // DISPLAY_UPDATE_INTERVAL_MS render loop rather than on every message.
+    let latestReading = null;
 
     // Zero-reference offsets set by the "Zero Roll / Pitch / Yaw" button.
     let offsetRoll = 0;
@@ -691,7 +706,7 @@ const char webpage[] PROGMEM = R"HTML(
       socket = new WebSocket("ws://" + window.location.hostname + ":81/");
 
       socket.onopen = function() {
-        statusText.textContent = "Live · 30 Hz";
+        statusText.textContent = "Live · 10 Hz display";
         statusText.style.color = "#ff6600";
       };
 
@@ -717,7 +732,27 @@ const char webpage[] PROGMEM = R"HTML(
         lastPitch = pitch;
         lastYaw = yaw;
 
-        if (frozen) return;
+        // Stash the full reading; renderInstruments() picks it up on the
+        // next DISPLAY_UPDATE_INTERVAL_MS tick instead of drawing here.
+        latestReading = { roll, pitch, yaw, ax, ay, az, gx, gy, gz, mx, my, mz };
+      };
+
+      socket.onerror = function() {
+        socket.close();
+      };
+
+      socket.onclose = function() {
+        statusText.textContent = "Disconnected · reconnecting...";
+        statusText.style.color = "#ff8a80";
+        reconnectTimer = setTimeout(connectWebSocket, 1000);
+      };
+    }
+
+    // Applies one sensor reading to every instrument and text readout.
+    // Called at most once per DISPLAY_UPDATE_INTERVAL_MS, regardless of how
+    // often the WebSocket delivers new data.
+    function renderInstruments(reading) {
+        const { roll, pitch, yaw, ax, ay, az, gx, gy, gz, mx, my, mz } = reading;
 
         // Apply the zero-reference offsets set by the calibrate button.
         const calRoll = wrapAngle180(roll - offsetRoll);
@@ -764,23 +799,20 @@ const char webpage[] PROGMEM = R"HTML(
         gmPeaks.textContent = `MAX ${gPeakMax.toFixed(2)}   MIN ${gPeakMin.toFixed(2)}`;
         accelReadout.textContent =
           `X ${ax.toFixed(2)} Y ${ay.toFixed(2)} Z ${az.toFixed(2)} g`;
-      };
-
-      socket.onerror = function() {
-        socket.close();
-      };
-
-      socket.onclose = function() {
-        statusText.textContent = "Disconnected · reconnecting...";
-        statusText.style.color = "#ff8a80";
-        reconnectTimer = setTimeout(connectWebSocket, 1000);
-      };
     }
+
+    // Redraws the page from the most recent reading, at most every
+    // DISPLAY_UPDATE_INTERVAL_MS, independent of the WebSocket message rate.
+    clearInterval(displayTimer);
+    displayTimer = setInterval(function() {
+      if (frozen || !latestReading) return;
+      renderInstruments(latestReading);
+    }, DISPLAY_UPDATE_INTERVAL_MS);
 
     freezeButton.addEventListener("click", function() {
       frozen = !frozen;
       freezeButton.textContent = frozen ? "Resume" : "Freeze";
-      statusText.textContent = frozen ? "Frozen · inspect readings" : "Live · 30 Hz";
+      statusText.textContent = frozen ? "Frozen · inspect readings" : "Live · 10 Hz display";
     });
 
     fullscreenButton.addEventListener("click", function() {
