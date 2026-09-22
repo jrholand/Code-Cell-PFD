@@ -457,7 +457,7 @@ const char webpage[] PROGMEM = R"HTML(
 
 <body>
   <div class="header">
-    <h1>9 AxisPFD</h1>
+    <h1>9 Axis PFD</h1>
     <div id="status">Connecting...</div>
     <div class="toolbar">
       <button id="freezeButton" type="button">Freeze</button>
