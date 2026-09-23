@@ -40,12 +40,19 @@ JRH
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
+#include <Preferences.h>
 
 CodeCell myCodeCell;
 
 // Port 80 serves the webpage. Port 81 carries the live IMU data.
 WebServer webServer(80);
 WebSocketsServer webSocket(81);
+
+// Persists the compass (magnetometer) hard-iron offsets and the gyro
+// zero-rate offsets in flash (NVS) so a "Calibrate Compass" run survives
+// a power cycle.
+Preferences preferences;
+const char* PREFS_NAMESPACE = "pfd";
 
 float Roll = 0.0;
 float Pitch = 0.0;
@@ -62,6 +69,41 @@ float GyroZ = 0.0;
 float MagX = 0.0;
 float MagY = 0.0;
 float MagZ = 0.0;
+
+// Zero-rate gyro offsets and hard-iron magnetometer offsets found by the
+// "Calibrate Compass" procedure. Subtracted from the raw readings before
+// they are broadcast, so the correction lives on the device rather than
+// in any one browser session.
+float GyroOffsetX = 0.0;
+float GyroOffsetY = 0.0;
+float GyroOffsetZ = 0.0;
+
+float MagOffsetX = 0.0;
+float MagOffsetY = 0.0;
+float MagOffsetZ = 0.0;
+
+// Compass calibration is a two-phase procedure triggered by the browser's
+// "Calibrate Compass" button (sends "CAL_START" over the WebSocket):
+//   1. CAL_MAG:   user rotates the unit through various orientations while
+//                 the min/max magnetometer reading per axis is tracked.
+//   2. CAL_GYRO:  user sets the unit down flat and still while the average
+//                 gyro reading per axis is tracked (its zero-rate offset).
+// Status text is pushed to the browser as "STATUS:..." messages, and the
+// finished offsets are saved to flash as "CAL_DONE:..." is sent.
+enum CalState : uint8_t { CAL_IDLE, CAL_MAG, CAL_GYRO };
+CalState calState = CAL_IDLE;
+unsigned long calPhaseStartMs = 0;
+unsigned long calStatusLastMs = 0;
+
+const unsigned long MAG_CAL_DURATION_MS = 15000;
+const unsigned long GYRO_CAL_DURATION_MS = 3000;
+const unsigned long CAL_STATUS_INTERVAL_MS = 500;
+
+float magMinX, magMinY, magMinZ;
+float magMaxX, magMaxY, magMaxZ;
+
+double gyroSumX, gyroSumY, gyroSumZ;
+uint32_t gyroSampleCount;
 
 // Change these if you want the CodeCell to use a different network name.
 // Wi-Fi passwords must contain at least eight characters.
@@ -535,6 +577,13 @@ const char webpage[] PROGMEM = R"HTML(
   <div class="calibrate-bar">
     <button id="calibrateButton" type="button" class="small-button">Zero Roll / Pitch / Yaw</button>
     <div class="mini-readout calibrate-hint" id="calibrateStatus">Hold the board straight and level, then press to zero the attitude readings.</div>
+
+    <button id="compassCalButton" type="button" class="small-button" style="margin-top:14px;">Calibrate Compass</button>
+    <div class="mini-readout calibrate-hint" id="compassCalStatus">
+      Move the unit through a slow figure-8 in the air, rolling and flipping it through every
+      orientation, away from desks, laptops, or other large metal/electronics. When prompted,
+      set it on a flat, stable surface and hold it still for a few seconds.
+    </div>
   </div>
 
   <script>
@@ -572,6 +621,10 @@ const char webpage[] PROGMEM = R"HTML(
 
     const calibrateButton = document.getElementById("calibrateButton");
     const calibrateStatus = document.getElementById("calibrateStatus");
+
+    const compassCalButton = document.getElementById("compassCalButton");
+    const compassCalStatus = document.getElementById("compassCalStatus");
+    const compassCalDefaultText = compassCalStatus.textContent;
 
     let socket;
     let reconnectTimer;
@@ -696,6 +749,21 @@ const char webpage[] PROGMEM = R"HTML(
       };
 
       socket.onmessage = function(event) {
+        // Compass calibration progress/completion messages, sent instead
+        // of a sensor-data line while a "Calibrate Compass" run is active.
+        if (event.data.startsWith("STATUS:") || event.data.startsWith("CAL_DONE:")) {
+          const done = event.data.startsWith("CAL_DONE:");
+          compassCalStatus.textContent = event.data.slice(event.data.indexOf(":") + 1);
+          if (done) {
+            compassCalButton.disabled = false;
+            compassCalButton.textContent = "Calibrate Compass";
+            setTimeout(function() {
+              compassCalStatus.textContent = compassCalDefaultText;
+            }, 4000);
+          }
+          return;
+        }
+
         const values = event.data.split(",");
 
         // roll,pitch,yaw,accel xyz,gyro xyz,mag xyz
@@ -809,6 +877,15 @@ const char webpage[] PROGMEM = R"HTML(
       }, 2500);
     });
 
+    compassCalButton.addEventListener("click", function() {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+      socket.send("CAL_START");
+      compassCalButton.disabled = true;
+      compassCalButton.textContent = "Calibrating...";
+      compassCalStatus.textContent = "Starting compass calibration...";
+    });
+
     connectWebSocket();
   </script>
 </body>
@@ -818,6 +895,100 @@ const char webpage[] PROGMEM = R"HTML(
 void handleWebpage() {
   // Send the webpage stored above whenever the browser opens the address.
   webServer.send_P(200, "text/html", webpage);
+}
+
+// Kicks off the two-phase compass calibration: rotate through all
+// orientations (magnetometer hard-iron offsets), then hold still on a
+// flat surface (gyro zero-rate offset).
+void startCompassCalibration() {
+  calState = CAL_MAG;
+  calPhaseStartMs = millis();
+  calStatusLastMs = 0;
+
+  magMinX = magMinY = magMinZ = 1e9f;
+  magMaxX = magMaxY = magMaxZ = -1e9f;
+
+  webSocket.broadcastTXT("STATUS:Move the unit through a slow figure-8, rolling and flipping it through every orientation");
+  Serial.println("Compass calibration: rotate through all orientations");
+}
+
+// Called once per sensor sample while a calibration phase is running.
+// Tracks the magnetometer min/max (phase 1) or the average gyro reading
+// (phase 2), pushes periodic status text to the browser, and saves the
+// finished offsets to flash (NVS) once both phases complete.
+void updateCompassCalibration() {
+  if (calState == CAL_IDLE) return;
+
+  unsigned long elapsed = millis() - calPhaseStartMs;
+  bool sendStatus = (millis() - calStatusLastMs >= CAL_STATUS_INTERVAL_MS);
+
+  if (calState == CAL_MAG) {
+    magMinX = min(magMinX, MagX);
+    magMaxX = max(magMaxX, MagX);
+    magMinY = min(magMinY, MagY);
+    magMaxY = max(magMaxY, MagY);
+    magMinZ = min(magMinZ, MagZ);
+    magMaxZ = max(magMaxZ, MagZ);
+
+    if (elapsed >= MAG_CAL_DURATION_MS) {
+      MagOffsetX = (magMaxX + magMinX) / 2.0f;
+      MagOffsetY = (magMaxY + magMinY) / 2.0f;
+      MagOffsetZ = (magMaxZ + magMinZ) / 2.0f;
+
+      calState = CAL_GYRO;
+      calPhaseStartMs = millis();
+      calStatusLastMs = 0;
+      gyroSumX = gyroSumY = gyroSumZ = 0.0;
+      gyroSampleCount = 0;
+
+      webSocket.broadcastTXT("STATUS:Set the unit on a flat, stable surface and hold it still");
+      Serial.println("Compass calibration: hold still to null the gyro zero-rate offset");
+      return;
+    }
+
+    if (sendStatus) {
+      calStatusLastMs = millis();
+      unsigned long remainingSec = (MAG_CAL_DURATION_MS - elapsed + 999) / 1000;
+      char msg[96];
+      snprintf(msg, sizeof(msg), "STATUS:Keep rotating and flipping the unit through all axes (%lus)", remainingSec);
+      webSocket.broadcastTXT(msg);
+    }
+    return;
+  }
+
+  // calState == CAL_GYRO
+  gyroSumX += GyroX;
+  gyroSumY += GyroY;
+  gyroSumZ += GyroZ;
+  gyroSampleCount++;
+
+  if (elapsed >= GYRO_CAL_DURATION_MS) {
+    if (gyroSampleCount > 0) {
+      GyroOffsetX = gyroSumX / gyroSampleCount;
+      GyroOffsetY = gyroSumY / gyroSampleCount;
+      GyroOffsetZ = gyroSumZ / gyroSampleCount;
+    }
+
+    preferences.putFloat("magOffX", MagOffsetX);
+    preferences.putFloat("magOffY", MagOffsetY);
+    preferences.putFloat("magOffZ", MagOffsetZ);
+    preferences.putFloat("gyroOffX", GyroOffsetX);
+    preferences.putFloat("gyroOffY", GyroOffsetY);
+    preferences.putFloat("gyroOffZ", GyroOffsetZ);
+
+    calState = CAL_IDLE;
+    webSocket.broadcastTXT("CAL_DONE:Compass calibration complete and saved");
+    Serial.println("Compass calibration complete - offsets saved to flash");
+    return;
+  }
+
+  if (sendStatus) {
+    calStatusLastMs = millis();
+    unsigned long remainingSec = (GYRO_CAL_DURATION_MS - elapsed + 999) / 1000;
+    char msg[96];
+    snprintf(msg, sizeof(msg), "STATUS:Hold still - nulling gyro drift (%lus)", remainingSec);
+    webSocket.broadcastTXT(msg);
+  }
 }
 
 void webSocketEvent(
@@ -835,6 +1006,12 @@ void webSocketEvent(
       Serial.printf("Browser %u disconnected\n", clientNumber);
       break;
 
+    case WStype_TEXT:
+      if (payloadLength == 9 && memcmp(payload, "CAL_START", 9) == 0) {
+        startCompassCalibration();
+      }
+      break;
+
     default:
       break;
   }
@@ -846,6 +1023,16 @@ void setup() {
   // Light (proximity/ambient) and the step counter are not used by this
   // visualizer, so they are left out of Init() entirely.
   myCodeCell.Init(MOTION_ROTATION + MOTION_ACCELEROMETER + MOTION_GYRO + MOTION_MAGNETOMETER);
+
+  // Restore the compass/gyro calibration offsets saved by a previous
+  // "Calibrate Compass" run, so they survive a power cycle.
+  preferences.begin(PREFS_NAMESPACE, false);
+  MagOffsetX = preferences.getFloat("magOffX", 0.0);
+  MagOffsetY = preferences.getFloat("magOffY", 0.0);
+  MagOffsetZ = preferences.getFloat("magOffZ", 0.0);
+  GyroOffsetX = preferences.getFloat("gyroOffX", 0.0);
+  GyroOffsetY = preferences.getFloat("gyroOffY", 0.0);
+  GyroOffsetZ = preferences.getFloat("gyroOffZ", 0.0);
 
   // Access-point mode lets a phone or computer connect without a router.
   WiFi.mode(WIFI_AP);
@@ -887,6 +1074,10 @@ void loop() {
     myCodeCell.Motion_GyroRead(GyroX, GyroY, GyroZ);
     myCodeCell.Motion_MagnetometerRead(MagX, MagY, MagZ);
 
+    // Feeds the raw Gyro/Mag readings above into the compass calibration
+    // state machine, if a "Calibrate Compass" run is in progress.
+    updateCompassCalibration();
+
     char sensorData[180];
 
     snprintf(
@@ -899,12 +1090,12 @@ void loop() {
       AccelX,
       AccelY,
       AccelZ,
-      GyroX,
-      GyroY,
-      GyroZ,
-      MagX,
-      MagY,
-      MagZ
+      GyroX - GyroOffsetX,
+      GyroY - GyroOffsetY,
+      GyroZ - GyroOffsetZ,
+      MagX - MagOffsetX,
+      MagY - MagOffsetY,
+      MagZ - MagOffsetZ
     );
 
     webSocket.broadcastTXT(sensorData);
